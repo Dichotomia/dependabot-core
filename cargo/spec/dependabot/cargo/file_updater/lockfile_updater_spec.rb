@@ -370,6 +370,432 @@ RSpec.describe Dependabot::Cargo::FileUpdater::LockfileUpdater do
         end
       end
 
+      context "when a shared dependency family requires a lockstep update" do
+        let(:manifest_fixture_name) { "futures_lockstep" }
+        let(:lockfile_fixture_name) { "futures_lockstep" }
+        let(:dependency_name) { "futures" }
+        let(:dependency_version) { "0.3.34" }
+        let(:dependency_previous_version) { "0.3.33" }
+        let(:requirements) do
+          [{ file: "Cargo.toml", requirement: "0.3", groups: [], source: nil }]
+        end
+        let(:previous_requirements) { requirements }
+        let(:futures_family) do
+          %w(futures futures-channel futures-core futures-executor futures-io
+             futures-macro futures-sink futures-task futures-util)
+        end
+        let(:commands) { [] }
+
+        # Simulate Cargo's real behaviour for this workspace shape: a plain
+        # `cargo update -p futures:0.3.33` cannot bump the shared `futures-*`
+        # siblings and leaves the line unchanged, while the `--precise` retry
+        # forces the coordinated 0.3.34 update across the whole family.
+        before do
+          allow(updater).to receive(:run_cargo_command) do |command, **|
+            commands << command
+            next unless command.include?("--precise")
+
+            content = File.read("Cargo.lock")
+            futures_family.each do |crate|
+              content = content.sub(
+                %(name = "#{crate}"\nversion = "0.3.33"),
+                %(name = "#{crate}"\nversion = "0.3.34")
+              )
+            end
+            File.write("Cargo.lock", content)
+          end
+        end
+
+        it "retries with --precise to force the coordinated update" do
+          expect(updated_lockfile_content).to include(%(name = "futures"\nversion = "0.3.34"))
+          expect(updated_lockfile_content).to include(%(name = "futures-util"\nversion = "0.3.34"))
+          expect(commands).to eq(
+            [
+              "cargo update -p futures:0.3.33",
+              "cargo update -p futures:0.3.33 --precise 0.3.34"
+            ]
+          )
+        end
+
+        context "when the plain update already moves the dependency" do
+          before do
+            allow(updater).to receive(:run_cargo_command) do |command, **|
+              commands << command
+
+              content = File.read("Cargo.lock")
+              futures_family.each do |crate|
+                content = content.sub(
+                  %(name = "#{crate}"\nversion = "0.3.33"),
+                  %(name = "#{crate}"\nversion = "0.3.34")
+                )
+              end
+              File.write("Cargo.lock", content)
+            end
+          end
+
+          it "does not issue a redundant --precise retry" do
+            expect(updated_lockfile_content).to include(%(name = "futures"\nversion = "0.3.34"))
+            expect(commands).to eq(["cargo update -p futures:0.3.33"])
+          end
+        end
+
+        context "when Cargo resolves to a different valid version" do
+          before do
+            allow(updater).to receive(:run_cargo_command) do |command, **|
+              commands << command
+
+              content = File.read("Cargo.lock")
+              futures_family.each do |crate|
+                content = content.sub(
+                  %(name = "#{crate}"\nversion = "0.3.33"),
+                  %(name = "#{crate}"\nversion = "0.3.35")
+                )
+              end
+              File.write("Cargo.lock", content)
+            end
+          end
+
+          it "keeps Cargo's choice without forcing --precise" do
+            expect(updated_lockfile_content).to include(%(name = "futures"\nversion = "0.3.35"))
+            expect(commands).to eq(["cargo update -p futures:0.3.33"])
+          end
+        end
+
+        context "when a newer entry already coexists and the plain update is a no-op" do
+          # The lockfile already contains an unrelated `futures` 0.3.35 entry
+          # (pulled by another dependent) alongside the stuck 0.3.33 line. The
+          # plain update is a no-op for our edge, so the fallback must still
+          # fire: the decision depends on whether *this* command moved the
+          # dependency, not on whether some higher version merely exists.
+          let(:lockfile_body) do
+            fixture("lockfiles", lockfile_fixture_name) + <<~COEXISTING
+              [[package]]
+              name = "futures"
+              version = "0.3.35"
+              source = "registry+https://github.com/rust-lang/crates.io-index"
+              checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+            COEXISTING
+          end
+
+          it "still forces --precise for the stuck previous-version line" do
+            expect(updated_lockfile_content).to include(%(name = "futures"\nversion = "0.3.34"))
+            expect(commands).to eq(
+              [
+                "cargo update -p futures:0.3.33",
+                "cargo update -p futures:0.3.33 --precise 0.3.34"
+              ]
+            )
+          end
+        end
+      end
+
+      context "when a shared dependency family in a real workspace needs a lockstep update" do
+        # Unstubbed, end-to-end regression for issue #16092. This mirrors the
+        # reporter's workspace: `futures = "0.3"` lives in
+        # `[workspace.dependencies]`, one member consumes it via
+        # `futures.workspace = true`, and a second member pulls `tower` (which
+        # depends directly on `futures-util`). That direct dependent pins the
+        # shared `futures-*` siblings, so a plain `cargo update -p futures:0.3.33`
+        # is a genuine no-op (Cargo will not bump the shared siblings), while the
+        # `--precise` retry forces the coordinated 0.3.34 update. The lockfile is
+        # a real all-0.3.33 family with genuine checksums, so this exercises the
+        # actual Cargo resolution rather than a stubbed substitution.
+        let(:manifest_fixture_name) { "futures_lockstep_workspace_root" }
+        let(:lockfile_fixture_name) { "futures_lockstep_workspace" }
+        let(:consumer_manifest) do
+          Dependabot::DependencyFile.new(
+            name: "consumer/Cargo.toml",
+            content: fixture("manifests", "futures_lockstep_workspace_consumer")
+          )
+        end
+        let(:locker_manifest) do
+          Dependabot::DependencyFile.new(
+            name: "locker/Cargo.toml",
+            content: fixture("manifests", "futures_lockstep_workspace_locker")
+          )
+        end
+        let(:dependency_files) { [manifest, lockfile, consumer_manifest, locker_manifest] }
+        let(:dependency_name) { "futures" }
+        let(:dependency_version) { "0.3.34" }
+        let(:dependency_previous_version) { "0.3.33" }
+        let(:requirements) do
+          [{ file: "Cargo.toml", requirement: "0.3", groups: ["workspace.dependencies"], source: nil }]
+        end
+        let(:previous_requirements) { requirements }
+
+        it "forces --precise so the whole futures family moves to 0.3.34" do
+          # `futures` itself is pinned exactly by `--precise`, so assert its
+          # exact version and checksum. The siblings are pulled via `^0.3.34`
+          # requirements and may legitimately resolve to a newer 0.3.x from the
+          # live registry, so only assert that none of them are left at 0.3.33.
+          expect(updated_lockfile_content).to include(%(name = "futures"\nversion = "0.3.34"))
+          %w(futures futures-channel futures-core futures-executor futures-io
+             futures-macro futures-sink futures-task futures-util).each do |crate|
+            expect(updated_lockfile_content).not_to include(%(name = "#{crate}"\nversion = "0.3.33"))
+          end
+          # 0.3.34 `futures` checksum, proving a real crates.io resolve rather
+          # than a stubbed version substitution.
+          expect(updated_lockfile_content).to include(
+            "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
+          )
+        end
+      end
+
+      context "when the target already coexists and the plain update repoints an edge" do
+        # The lockfile already carries both `previous_version` (kept by a
+        # legitimate transitive consumer that pins the old major) and the
+        # target version (pulled by another consumer). The plain update simply
+        # repoints our consumer's edge onto the already-present target entry:
+        # the `[[package]]` entries are byte-identical before and after, but the
+        # incoming edge moved. The fallback must NOT fire here — forcing
+        # `cargo update -p foo:1.0.0 --precise 2.0.0` would fail because the
+        # retained old major cannot move.
+        let(:manifest_body) do
+          <<~TOML
+            [package]
+            name = "app"
+            version = "0.1.0"
+
+            [dependencies]
+            foo = "2.0.0"
+          TOML
+        end
+        let(:lockfile_body) do
+          <<~LOCK
+            # This file is automatically @generated by Cargo.
+            # It is not intended for manual editing.
+            version = 4
+
+            [[package]]
+            name = "app"
+            version = "0.1.0"
+            dependencies = [
+             "foo 1.0.0",
+            ]
+
+            [[package]]
+            name = "keeper"
+            version = "0.1.0"
+            dependencies = [
+             "foo 1.0.0",
+            ]
+
+            [[package]]
+            name = "other"
+            version = "0.1.0"
+            dependencies = [
+             "foo 2.0.0",
+            ]
+
+            [[package]]
+            name = "foo"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "1111111111111111111111111111111111111111111111111111111111111111"
+
+            [[package]]
+            name = "foo"
+            version = "2.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "2222222222222222222222222222222222222222222222222222222222222222"
+          LOCK
+        end
+        let(:dependency_name) { "foo" }
+        let(:dependency_version) { "2.0.0" }
+        let(:dependency_previous_version) { "1.0.0" }
+        let(:requirements) do
+          [{ file: "Cargo.toml", requirement: "2.0.0", groups: ["dependencies"], source: nil }]
+        end
+        let(:previous_requirements) { requirements }
+        let(:commands) { [] }
+
+        before do
+          allow(updater).to receive(:run_cargo_command) do |command, **|
+            commands << command
+            next if command.include?("--precise")
+
+            # Plain update repoints `app`'s edge onto the pre-existing 2.0.0
+            # entry; `keeper` keeps `foo 1.0.0`, so both entries survive.
+            content = File.read("Cargo.lock")
+            content = content.sub(
+              %(name = "app"\nversion = "0.1.0"\ndependencies = [\n "foo 1.0.0",\n]),
+              %(name = "app"\nversion = "0.1.0"\ndependencies = [\n "foo 2.0.0",\n])
+            )
+            File.write("Cargo.lock", content)
+          end
+        end
+
+        it "respects the repointed edge and does not force a doomed --precise" do
+          expect(updated_lockfile_content)
+            .to include(%(name = "app"\nversion = "0.1.0"\ndependencies = [\n "foo 2.0.0",))
+          expect(commands).to eq(["cargo update -p foo:1.0.0"])
+        end
+      end
+
+      context "when the plain update only re-renders the dependency's outgoing edges" do
+        # During a grouped resolution Cargo can add a version qualifier to this
+        # crate's *own* outgoing sibling edge (`"futures-util"` ->
+        # `"futures-util 0.3.33"`) because another version of the sibling starts
+        # coexisting, all while leaving `futures` itself stuck at 0.3.33. The
+        # crate did not move, so the fallback must still fire: the move signature
+        # must ignore the outgoing `dependencies` array and compare identity
+        # only.
+        let(:manifest_body) do
+          <<~TOML
+            [package]
+            name = "app"
+            version = "0.1.0"
+
+            [dependencies]
+            futures = "0.3"
+          TOML
+        end
+        let(:lockfile_body) do
+          <<~LOCK
+            # This file is automatically @generated by Cargo.
+            # It is not intended for manual editing.
+            version = 4
+
+            [[package]]
+            name = "app"
+            version = "0.1.0"
+            dependencies = [
+             "futures",
+            ]
+
+            [[package]]
+            name = "futures"
+            version = "0.3.33"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "1111111111111111111111111111111111111111111111111111111111111111"
+            dependencies = [
+             "futures-util",
+            ]
+
+            [[package]]
+            name = "futures-util"
+            version = "0.3.33"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "2222222222222222222222222222222222222222222222222222222222222222"
+          LOCK
+        end
+        let(:dependency_name) { "futures" }
+        let(:dependency_version) { "0.3.34" }
+        let(:dependency_previous_version) { "0.3.33" }
+        let(:requirements) do
+          [{ file: "Cargo.toml", requirement: "0.3", groups: ["dependencies"], source: nil }]
+        end
+        let(:previous_requirements) { requirements }
+        let(:commands) { [] }
+
+        before do
+          allow(updater).to receive(:run_cargo_command) do |command, **|
+            commands << command
+            content = File.read("Cargo.lock")
+
+            content =
+              if command.include?("--precise")
+                content.gsub(%(version = "0.3.33"), %(version = "0.3.34"))
+              else
+                # Plain update only qualifies the outgoing sibling edge; `futures`
+                # stays at 0.3.33.
+                content.sub(%( "futures-util",), %( "futures-util 0.3.33",))
+              end
+
+            File.write("Cargo.lock", content)
+          end
+        end
+
+        it "still forces --precise because the crate's identity did not move" do
+          expect(updated_lockfile_content).to include(%(name = "futures"\nversion = "0.3.34"))
+          expect(commands).to eq(
+            [
+              "cargo update -p futures:0.3.33",
+              "cargo update -p futures:0.3.33 --precise 0.3.34"
+            ]
+          )
+        end
+      end
+
+      context "when two parents swap the dependency versions between them" do
+        # One parent moves `foo 1.0.0` -> `foo 2.0.0` while another moves
+        # `foo 2.0.0` -> `foo 1.0.0`. The globally-sorted set of edge strings is
+        # unchanged, but an edge genuinely moved, so the fallback must NOT fire.
+        # This is caught only because each edge is qualified by its parent.
+        let(:manifest_body) do
+          <<~TOML
+            [package]
+            name = "app"
+            version = "0.1.0"
+
+            [dependencies]
+            foo = "2.0.0"
+          TOML
+        end
+        let(:lockfile_body) do
+          <<~LOCK
+            # This file is automatically @generated by Cargo.
+            # It is not intended for manual editing.
+            version = 4
+
+            [[package]]
+            name = "a"
+            version = "0.1.0"
+            dependencies = [
+             "foo 1.0.0",
+            ]
+
+            [[package]]
+            name = "b"
+            version = "0.1.0"
+            dependencies = [
+             "foo 2.0.0",
+            ]
+
+            [[package]]
+            name = "foo"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "1111111111111111111111111111111111111111111111111111111111111111"
+
+            [[package]]
+            name = "foo"
+            version = "2.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            checksum = "2222222222222222222222222222222222222222222222222222222222222222"
+          LOCK
+        end
+        let(:dependency_name) { "foo" }
+        let(:dependency_version) { "2.0.0" }
+        let(:dependency_previous_version) { "1.0.0" }
+        let(:requirements) do
+          [{ file: "Cargo.toml", requirement: "2.0.0", groups: ["dependencies"], source: nil }]
+        end
+        let(:previous_requirements) { requirements }
+        let(:commands) { [] }
+
+        before do
+          allow(updater).to receive(:run_cargo_command) do |command, **|
+            commands << command
+            next if command.include?("--precise")
+
+            content = File.read("Cargo.lock")
+            content = content
+                      .sub(%(name = "a"\nversion = "0.1.0"\ndependencies = [\n "foo 1.0.0",),
+                           %(name = "a"\nversion = "0.1.0"\ndependencies = [\n "foo 2.0.0",))
+                      .sub(%(name = "b"\nversion = "0.1.0"\ndependencies = [\n "foo 2.0.0",),
+                           %(name = "b"\nversion = "0.1.0"\ndependencies = [\n "foo 1.0.0",))
+            File.write("Cargo.lock", content)
+          end
+        end
+
+        it "detects the per-parent edge movement and does not force --precise" do
+          expect(updated_lockfile_content)
+            .to include(%(name = "a"\nversion = "0.1.0"\ndependencies = [\n "foo 2.0.0",))
+          expect(commands).to eq(["cargo update -p foo:1.0.0"])
+        end
+      end
+
       context "when the previous version also exists from another source" do
         let(:manifest_fixture_name) { "duplicate_source_versions" }
         let(:lockfile_fixture_name) { "duplicate_source_versions" }
